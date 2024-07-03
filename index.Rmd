@@ -1,0 +1,2408 @@
+---
+title: "Reproducible Supplement"
+description: For manuscript "Development and validation of predictive models of early immune effector cell-associated hematotoxicity (eIPMs)" by Liang et al., 2024
+author:
+  - name: Emily C. Liang, MD
+    affiliation: University of Washington and Fred Hutchinson Cancer Center
+date: "`r Sys.Date()`"
+output:
+  distill::distill_article:
+    code_folding: true
+    toc: true
+    toc_float: true
+    toc_depth: 3
+---
+
+```{r setup, include = FALSE}
+knitr::opts_chunk$set(message = FALSE, warning = FALSE) 
+library(distill)
+library(knitr)
+library(rmarkdown)
+```
+
+## Load the required packages
+```{r}
+library(openxlsx)
+library(here)
+library(janitor)
+library(tidyverse)
+library(labelled)
+library(zoo)
+library(gtsummary)
+library(prodlim)
+library(ggsurvfit)
+library(ggplot2)
+library(scales)
+library(plotly)
+library(ggrepel)
+library(patchwork)
+library(pmsampsize)
+library(caret)
+library(rms)
+library(tidymodels)
+library(glmnet)
+library(probably)
+library(vip)
+library(runway)
+library(cutpointr)
+library(dcurves)
+theme_set(theme_bw())
+theme_gtsummary_compact()
+```
+
+## Automated ICAHT grading
+
+### Import data
+```{r}
+# Clinical data
+df <-
+  read.xlsx(
+    here(
+      "dfs",
+      "EPIC Data Export",
+      "2024.05.29.PatientDemographics for Supplement.xlsx"
+    ),
+    detectDates = TRUE
+  )
+df <- clean_names(df)
+df <- df %>%
+  filter(cart_num == 1)
+
+# CBC data
+df_cbc <-
+  read.xlsx(here("dfs", "EPIC Data Export", "2024.05.29.hems.xlsx"),
+            detectDates = TRUE)
+df_cbc <- clean_names(df_cbc)
+df_cbc <- df_cbc %>%
+  filter(cart_num == 1)
+
+# Fill in missing death dates in df from LTFU datasets
+df_death_LTFU <-
+  read.xlsx(
+    here(
+      "dfs",
+      "Clinical Datasets",
+      "IMTXLTFU-10039_Cause_of_Death_230926.xlsx"
+    ),
+    detectDates = TRUE
+  ) %>%
+  clean_names()
+
+df_LTFU_additional <-
+  read.xlsx(
+    here(
+      "dfs",
+      "Clinical Datasets",
+      "Death and Progression Updates LTFU 240313.xlsx"
+    ),
+    detectDates = TRUE
+  ) %>%
+  clean_names()
+
+df_death_LTFU <- df_death_LTFU %>%
+  separate(col = upn,
+           into = c("initials", "upn"),
+           sep = " ") %>%
+  select(upn, date_of_death, cause_of_death) %>%
+  mutate(date_of_death = as.Date(date_of_death)) %>%
+  rename(deathdat = date_of_death)
+
+df <- rows_patch(df,
+                 df_death_LTFU %>% select(upn, deathdat),
+                 by = "upn",
+                 unmatched = "ignore")
+df <- rows_patch(
+  df,
+  df_LTFU_additional %>% select(upn, deathdat),
+  by = "upn",
+  unmatched = "ignore"
+)
+
+# Make the date of last follow-up the latest of: 1) date of death, 2) date of last follow-up from LTFU, 3) date of last follow-up from EMR
+df_LTFU <-
+  read.xlsx(here("dfs", "Clinical Datasets", "LTFU 240529.xlsx"),
+            detectDates = TRUE) %>%
+  clean_names()
+
+df_fu_LTFU <- df_LTFU %>%
+  select(upn, date_of_latest_progress_clinic_note) %>%
+  filter(!is.na(date_of_latest_progress_clinic_note)) %>%
+  drop_na() %>%
+  group_by(upn) %>%
+  dplyr::summarize(date_of_latest_progress_clinic_note = max(date_of_latest_progress_clinic_note))
+
+df <- df %>%
+  left_join(., df_fu_LTFU, by = "upn") %>%
+  rowwise() %>%
+  mutate(datelast =
+           max(
+             deathdat,
+             date_of_latest_progress_clinic_note,
+             datelast,
+             na.rm = TRUE
+           ))
+```
+
+### Create data frame with longitudinal daily ANC values (including interpolating missing data)
+```{r}
+# Exclude patients who died prior to day +14
+df <- df %>%
+  filter(deathdat - cart_date >= 14 | is.na(deathdat))
+
+# Create data frame with longitudinal ANC values
+# If last lab draw occurs after 23:00, assign ANC value to the following day
+df_ancx <- df_cbc %>%
+  filter(upn %in% df$upn) %>%
+  select(upn, cart_date, date, time, ancx) %>%
+  mutate(time = as.POSIXct(time, format = "%H:%M:%S"),
+         new_date  = as.Date(ifelse(
+           time >= as.POSIXct("23:00:00", format = "%H:%M:%S"),
+           date + days(1),
+           date
+         ))) %>%
+  ungroup()
+
+df_ancx <- df_ancx %>% 
+  select(-date, -time) %>% 
+  rename(date = new_date)
+
+df_ancx <- df_ancx %>% 
+  mutate(time_post_inf = as.numeric(date - cart_date)) %>%
+  filter(time_post_inf %in% 0:30) %>%
+  distinct(upn, time_post_inf, ancx, .keep_all = TRUE) %>% # Keep unique combinations of upn, time_post_inf, and anc
+  group_by(upn, time_post_inf) %>% 
+  slice_min(ancx) %>% # For each combination of upn and time_post_inf, keep the lowest ANC value
+  ungroup()
+
+# Fill in missing time_post_inf and replicate UPNs by first creating df_extract
+df_extract <- df %>%
+  distinct(upn, cart_date, datelast)
+
+# Create replicate_ids() to replicate UPNs according to duration of follow-up
+replicate_ids <- function(upn, cart_date, datelast) {
+  if (is.na(datelast) || (datelast - cart_date) >= 30) {
+    return(replicate(31, upn))
+  } else {
+    return(replicate(datelast - cart_date + 1, upn)) # Add 1 to account for day +0
+  }
+}
+
+# Create df_id with replicated UPNs
+df_id <- df_extract %>%
+  dplyr::rowwise() %>%
+  do(data.frame(upn = replicate_ids(.$upn, .$cart_date, .$datelast))) %>% 
+  group_by(upn) %>% 
+  mutate(time_post_inf = row_number() - 1) %>% 
+  ungroup()
+
+# Merge df_id with df
+df_ancx <- df_ancx %>%
+  group_by(upn) %>%
+  merge(.,
+        df_id,
+        by = c("upn", "time_post_inf"),
+        all.y = TRUE) %>% 
+  ungroup()
+
+# Fill in cart_date and date columns
+df_ancx <- df_ancx %>%
+  group_by(upn) %>%
+  mutate(cart_date = as.Date(ifelse(
+    is.na(cart_date), max(cart_date, na.rm = TRUE), cart_date
+  )),
+  date = as.Date(cart_date + time_post_inf)) %>% 
+  ungroup()
+
+# Linearly interpolate missing ANC values for up to 7 consecutive NAs
+df_ancx <- df_ancx %>%
+  arrange(upn, time_post_inf) %>%
+  group_by(upn) %>% 
+  mutate(ancx = na.approx(ancx, maxgap = 7, rule = 2)) %>% 
+  ungroup()
+
+# Round ANC values to nearest integer divisible by 10 (like real ANC values)
+df_ancx <- df_ancx %>% 
+  mutate(ancx = round(ancx/10) * 10)
+
+# Exclude those with missing ANCs after interpolation
+df_ancx <- df_ancx %>%
+  group_by(upn) %>%
+  mutate(sumNA = sum(is.na(ancx))) %>%
+  filter(sumNA == 0) %>% 
+  ungroup()
+
+# Add UWIDs
+df_ancx <- df_ancx %>%
+  inner_join(., df %>% select(upn, uwid), by = "upn") %>%
+  select(upn, uwid, cart_date, date, time_post_inf, ancx)
+
+# Log10-transform ANC and select variables for clustering
+df_anc <- df_ancx %>%
+  mutate(anc = ifelse(ancx == 0, 0.01, ancx),
+         anc = log10(anc)) %>%
+  select(upn, time_post_inf, anc)
+
+var_label(df_anc$time_post_inf) <- "Days after CAR T-cell infusion"
+var_label(df_anc$anc) <- "ANC"
+```
+
+### Automatically assign eICAHT grades using {heatwaveR}
+```{r}
+# For eICAHT threshold of ANC ≤ 500 cells/μL
+df_exceedances_below_501 <-
+  # ddply splits a data frame, applies a function, and combines results into a data frame
+  plyr::ddply(.data = df_ancx, .variables = c("upn", "uwid"), .fun = function(data) {
+    heatwaveR::exceedance(
+      data,
+      x = date,
+      y = ancx,
+      threshold = 501,
+      below = TRUE, # Whether to detect events below the threshold,
+      minDuration = 1, # Minimum duration for acceptance of detected events
+      joinAcrossGaps = TRUE, # Whether to join events which occur before/after gap
+      maxGap = 2 # Maximum length of gap allowed for joining of events
+    )$exceedance
+  })
+
+# Create data frame containing maximum duration of events for each UPN
+df_anc_500 <- df_exceedances_below_501 %>%
+  select(upn, uwid, exceedance_no, duration) %>%
+  group_by(upn, uwid) %>%
+  dplyr::summarize(duration_below_501_max = max(duration)) %>%
+  mutate(duration_below_501_max = ifelse( # Replace NAs with 0 (never below threshold)
+    is.na(duration_below_501_max),
+    0,
+    duration_below_501_max
+  ))
+
+# For eICAHT threshold of ANC ≤ 100 cells/μL
+df_exceedances_below_101 <-
+  plyr::ddply(.data = df_ancx, .variables = c("upn"), .fun = function(data) {
+    heatwaveR::exceedance(
+      data,
+      x = date,
+      y = ancx,
+      threshold = 101,
+      below = TRUE,
+      minDuration = 1,
+      joinAcrossGaps = TRUE,
+      maxGap = 2,
+      maxPadLength = FALSE
+    )$exceedance
+  })
+
+df_anc_100 <- df_exceedances_below_101 %>%
+  select(upn, exceedance_no, duration) %>%
+  group_by(upn) %>%
+  dplyr::summarize(duration_below_101_max = max(duration)) %>%
+  mutate(duration_below_101_max = ifelse(
+    is.na(duration_below_101_max),
+    0,
+    duration_below_101_max
+  ))
+
+# Create data frame with exceedances below each threshold for each UPN
+df_icaht <- df_anc_500 %>% 
+  left_join(., df_anc_100, by = "upn") %>% 
+  ungroup()
+
+# Create column with ICAHT grades
+df_icaht <- df_icaht %>%
+  mutate(
+    icaht_grade = case_when(
+      duration_below_501_max == 0 & duration_below_101_max == 0 ~ "Grade 0",
+      duration_below_501_max %in% 1:6 & duration_below_101_max < 7 ~ "Grade 1",
+      duration_below_501_max %in% 7:13 & duration_below_101_max < 7 ~ "Grade 2",
+      (duration_below_501_max %in% 14:30 & duration_below_101_max < 7) |
+        (duration_below_501_max < 31 & duration_below_101_max %in% 7:13) ~ "Grade 3",
+      (duration_below_501_max >= 31 & duration_below_101_max < 14) | duration_below_101_max >= 14 ~ "Grade 4"
+    )
+  )
+```
+
+### Additionally define grade 4 ICAHT
+```{r}
+df_exceedances_below_501 <- df_exceedances_below_501 %>%
+  filter(!is.na(exceedance_no)) %>%  # Filter out patients who never had neutropenia
+  select(upn, 
+         exceedance_below_501_no = exceedance_no, 
+         exceedance_below_501_date_start = date_start,
+         exceedance_below_501_date_end = date_end) %>% 
+  mutate(exceedance_below_501_date_start = as.Date(exceedance_below_501_date_start), # Convert dates to class "Date"
+         exceedance_below_501_date_end = as.Date(exceedance_below_501_date_end))
+
+# Add date of last available ANC value
+df_last_time_post_inf <- df_ancx %>%
+  arrange(upn, time_post_inf) %>%
+  group_by(upn) %>% 
+  slice_tail(n = 1) %>% # Select last row
+  ungroup() %>% 
+  select(upn, 
+         cart_date,
+         last_lab_date = date)
+
+df_exceedances_below_501 <- df_exceedances_below_501 %>% 
+  left_join(., df_last_time_post_inf, by = "upn")
+
+# Classify patients who had exceedances below ANC ≤ 500 cells/μL 
+# starting between days 0-3 and ending on "last_lab_date" as grade 4 early ICAHT
+df_exceedances_below_501 <- df_exceedances_below_501 %>%
+  mutate(
+    icaht_grade_4 = ifelse(
+      exceedance_below_501_date_start - cart_date <= 3 &
+        exceedance_below_501_date_end == last_lab_date,
+      "Yes",
+      "No"
+    )
+  )
+
+df_icaht <- df_icaht %>%
+  left_join(.,
+            df_exceedances_below_501 %>% select(upn, icaht_grade_4),
+            by = "upn")
+
+df_icaht <- df_icaht %>%
+  mutate(
+    icaht_grade = dplyr::if_else(
+      icaht_grade_4 == "Yes",
+      "Grade 4",
+      icaht_grade,
+      missing = icaht_grade
+    )
+  ) %>%
+  distinct(upn,
+           icaht_grade,
+           .keep_all = TRUE)
+```
+
+### Update ICAHT grades for patients who were included Liang, Rejeski, et al., Bone Marrow Transplantation 2024 (n = 605)
+```{r}
+# Data frame contains automated grades assigned by {heatwaveR} approach, MSKCC manual code, and manual grades for discrepancies
+df_check <-
+  read.xlsx(here("dfs",
+                 "Manual vs. Automated Early ICAHT Grades.xlsx")) %>% 
+  clean_names()
+
+# Filter to cases incorrectly graded by {heatwaveR} approach
+df_check <- df_check %>% 
+  filter(center == "FHCC",
+         disagreement_manual_heatwave_r == 1) %>% 
+  select(upn = patient_id,
+         manual_icaht_grade) %>% 
+  mutate(manual_icaht_grade = paste0("Grade ", manual_icaht_grade))
+
+# Replace grades in df_icaht with correct grades
+df_icaht <- df_icaht %>% 
+  left_join(., df_check, by = "upn")
+
+df_icaht <- df_icaht %>%
+  mutate(icaht_grade = ifelse(!is.na(manual_icaht_grade), manual_icaht_grade, icaht_grade)) %>% 
+  select(-icaht_grade_4, -manual_icaht_grade)
+
+# Add ICAHT grades to df
+df <- df %>% 
+  filter(upn %in% df_icaht$upn) %>% 
+  left_join(., df_icaht %>% select(upn, icaht_grade), by = "upn")
+
+df <- df %>% 
+  mutate(icaht_grade_num = case_when(icaht_grade == "Grade 0" ~ 0,
+                                     icaht_grade == "Grade 1" ~ 1,
+                                     icaht_grade == "Grade 2" ~ 2,
+                                     icaht_grade == "Grade 3" ~ 3,
+                                     icaht_grade == "Grade 4" ~ 4))
+```
+
+
+## Import/wrangle additional data
+
+### Clinical data
+```{r}
+df <- df %>%
+  mutate(
+    disease_cat = 
+      factor(disease_cat,
+      levels = c("Indolent NHL", "Aggressive NHL", "ALL", "MM/PCL")),
+    product_cat = as.factor(product_cat),
+    car_target = case_when(
+      product_cat == "Commercial CD19 CAR T-cell product with CD28 costimulatory domain (axi-cel, brexu-cel)" |
+        product_cat == "Commercial CD19 CAR T-cell product with 4-1BB costimulatory domain (liso-cel, tisa-cel)" |
+        product_infused == "JCAR014" |
+        product_infused == "JCAR021" ~ "CD19",
+      product_infused == "Investigational CD20 product" ~ "CD20",
+      .default = "BCMA"
+    ),
+    car_target = factor(car_target,
+      levels = c("BCMA", "CD19", "CD20")),
+    racenih_cat = ifelse(racenih == "White", "White", "Non-White"),
+    racenih_cat = fct_relevel(as.factor(racenih_cat), "White"),
+    ethnih_cat = ifelse(
+      ethnih == "Hispanic or Latino",
+      "Hispanic or Latino",
+      "Not Hispanic/Latino or Unknown"
+    ),
+    ethnih = fct_relevel(as.factor(ethnih_cat), "Not Hispanic/Latino or Unknown"),
+    icaht_grade = fct_relevel(icaht_grade, "Grade 0"),
+    icaht_grade_3_4 = ifelse(icaht_grade_num %in% 3:4, 1, 0),
+    prior_hct = ifelse(!is.na(txdate1) &
+                         txdate1 < cart_date, "Yes", "No")
+  )
+
+df <- df %>%
+  select(
+    upn,
+    cart_num,
+    cart_date,
+    cart_age,
+    gender_desc,
+    racenih,
+    racenih_cat,
+    ethnih,
+    ethnih_cat,
+    disease_cat,
+    prior_hct,
+    product_cat,
+    product_infused,
+    car_target,
+    costim_domain,
+    datelast,
+    deathdat,
+    icaht_grade,
+    icaht_grade_num,
+    icaht_grade_3_4
+  )
+```
+
+### CRS/ICANS data
+```{r}
+df_tox <-
+  read.xlsx(here("dfs", "CAR Toxicity Data 240529.xlsx"),
+            detectDates = TRUE) %>%
+  clean_names()
+
+df <- df %>% 
+  left_join(., df_tox %>% select(upn, crs_grade, icans_grade), by = "upn")
+
+var_label(df$cart_age) <- "Age"
+var_label(df$gender_desc) <- "Sex"
+var_label(df$racenih) <- "Race"
+var_label(df$racenih_cat) <- "Race"
+var_label(df$ethnih) <- "Ethnicity"
+var_label(df$ethnih_cat) <- "Ethnicity"
+var_label(df$disease_cat) <- "Disease"
+var_label(df$prior_hct) <- "Prior HCT"
+var_label(df$product_cat) <- "CAR T-cell product category"
+var_label(df$product_infused) <- "CAR T-cell product"
+var_label(df$car_target) <- "CAR target"
+var_label(df$costim_domain) <- "Costimulatory domain"
+var_label(df$crs_grade) <- "CRS grade"
+var_label(df$icans_grade) <- "ICANS grade"
+var_label(df$icaht_grade) <- "ICAHT grade"
+```
+
+### Lymphodepletion regimen data
+```{r}
+# Regimen
+df_LD <-
+  read.xlsx(
+    here(
+      "dfs",
+      "EPIC Data Export",
+      "2024.05.29.lymphodepletionRegimen.xlsx"
+    ),
+    detectDates = TRUE
+  ) %>%
+  clean_names()
+df_LD <- df_LD %>% filter(cart_num == 1)
+
+df_LD <- df_LD %>%
+  mutate(LD_regimen = case_when(
+    grepl("cyclophosphamide", dep_regimen, ignore.case = TRUE) &
+      grepl("fludarabine", dep_regimen, ignore.case = TRUE) ~ "Cy/Flu",
+    .default = "Other"
+  ))
+
+# Dose
+df_LD_dose <-
+  read.xlsx(here("dfs",
+                 "EPIC Data Export",
+                 "2024.05.29.treatmentNotes.xlsx"),
+            detectDates = TRUE) %>%
+  clean_names()
+df_LD_dose <- df_LD_dose %>% filter(cart_num == 1)
+
+df_LD_dose <- df_LD_dose %>%
+  group_by(upn) %>%
+  mutate(LD_dose = paste(condition_notes, collapse = " ")) %>% 
+  slice_head(n = 1)
+
+# Join data frames
+df_LD <- df_LD %>% 
+  left_join(df_LD_dose %>% select(upn, LD_dose), by = "upn")
+
+# Categorize lymphodepletion regimens
+# Define high-intensity Cy/Flu regimens
+high_cy_flu <-
+  c(
+    "Cyclophosphamide 500 mg/msq/day",
+    "Cyclophosphamide 60 mg/kg x 1 dose",
+    "Cyclophosphamide 60 mg/kg IV x 1 dose",
+    "Cyclophosphamide 30 mg/kg x 1 dose"
+  )
+
+df_LD <- df_LD %>%
+  mutate(
+    LD_regimen_cat = case_when(
+      LD_regimen == "Cy/Flu" &
+        grepl(paste(high_cy_flu, collapse = "|"), LD_dose, ignore.case = TRUE) ~ "High-intensity Cy/Flu",
+      LD_regimen == "Cy/Flu" ~ "Low-intensity Cy/Flu",
+      .default = "Other"
+    )
+  )
+
+# Add LD regimen data to df
+df <- df %>% 
+  left_join(., df_LD %>% select(upn, LD_regimen_cat), by = "upn")
+
+df <- df %>%
+  mutate(
+    LD_regimen_cat = fct_relevel(
+      LD_regimen_cat,
+      c("Low-intensity Cy/Flu", "High-intensity Cy/Flu", "Other")
+    ),
+    LD_regimen_low_CyFlu_vs_other = ifelse(
+      LD_regimen_cat == "Low-intensity Cy/Flu",
+      "Low-intensity Cy/Flu",
+      "Other"
+    ),
+    LD_regimen_low_CyFlu_vs_other = factor(
+      LD_regimen_low_CyFlu_vs_other,
+      levels = c("Low-intensity Cy/Flu", "Other")
+    )
+  )
+
+var_label(df$LD_regimen_cat) <- "Lymphodepletion regimen"
+var_label(df$LD_regimen_low_CyFlu_vs_other) <- "Lymphodepletion regimen (low-dose Cy/Flu vs. other)"
+```
+
+### Laboratory data
+```{r}
+# If last CBC draw occurs after 23:00, assign value to the following day
+df_cbc <- df_cbc %>%
+  mutate(time = as.POSIXct(time, format = "%H:%M:%S"),
+         date  = as.Date(ifelse(
+           time >= as.POSIXct("23:00:00", format = "%H:%M:%S"),
+           date + 1,
+           date
+         )),
+         day = as.numeric(date - cart_date)) %>%
+  ungroup()
+
+# Other labs
+df_labs <-
+  read.xlsx(here("dfs", "EPIC Data Export", "2024.05.29.labs.xlsx"),
+            detectDates = TRUE) %>%
+  clean_names()
+
+df_labs <- df_labs %>%
+  filter(cart_num == 1)
+
+df_labs <- df_labs %>%
+  mutate(time = as.POSIXct(time, format = "%H:%M:%S"),
+         new_date  = as.Date(ifelse(
+           time >= as.POSIXct("23:00:00", format = "%H:%M:%S"),
+           date + 1,
+           date
+         )),
+         new_day = as.numeric(new_date - cart_date)) %>%
+  ungroup()
+
+# Pre-lymphodepletion labs
+df_pre_ld <-
+  read.xlsx(
+    here(
+      "dfs",
+      "EPIC Data Export",
+      "2024.05.29.prelymphodepletionLabsHems.xlsx"
+    ),
+    detectDates = TRUE
+  ) %>%
+  clean_names()
+
+df_pre_ld <- df_pre_ld %>%
+  filter(cart_num == 1)
+
+## Add pre-LD ANC, ALC, Hb, platelet count, and LDH to df
+df <- df_pre_ld %>%
+  mutate(
+    anc_pre_ld = ancx_pre_d / 1000,
+    lym_pre_ld = lymx_pre_d / 1000,
+    hb_pre_ld = hgb_amt_pre_d,
+    plt_pre_ld = tot_platelet_cnt_pre_d / 1000
+  ) %>%
+  select(upn, anc_pre_ld, lym_pre_ld, hb_pre_ld, plt_pre_ld, ldh_pre_ld = ldh_u_l_pre_d) %>%
+  left_join(df, ., by = "upn")
+
+var_label(df$anc_pre_ld) <- "Pre-LD ANC"
+var_label(df$hb_pre_ld) <- "Pre-LD Hb"
+var_label(df$plt_pre_ld) <- "Pre-LD platelet count"
+
+# Add day +0 LDH to df
+# If there are multiple day +0 values, use the earliest one (corresponding to pre-infusion value)
+df <- df_labs %>%
+  filter(day == 0, !is.na(ldh_u_l)) %>%
+  select(upn, day, time, ldh_u_l) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, ldh_u_l) %>%
+  rename(ldh_day_0 = ldh_u_l) %>%
+  left_join(df, ., by = "upn")
+
+# Add pre-LD, day +0, day +3, day +5, day +7, and peak CRP to df (where peak is between days +0 and +30)
+# For day +3, use values between days +2 through +4
+# If there are multiple day +0 values, use the earliest one (corresponding to pre-infusion value)
+# For the other timepoints: if there are multiple values, use the peak/nadir value (depending on the laboratory test of interest)
+df <- df_pre_ld %>%
+  select(upn, crp_mg_l_pre_d) %>% 
+  rename(crp_pre_ld = crp_mg_l_pre_d) %>% 
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 0, !is.na(crp_mg_l)) %>%
+  select(upn, day, time, crp_mg_l) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, crp_mg_l) %>%
+  rename(crp_day_0 = crp_mg_l) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 2:4, !is.na(crp_mg_l)) %>%
+  select(upn, day, crp_mg_l) %>%
+  group_by(upn) %>%
+  dplyr::summarize(crp_day_3 = max(crp_mg_l)) %>%
+  select(upn, crp_day_3) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 5, !is.na(crp_mg_l)) %>%
+  select(upn, day, crp_mg_l) %>%
+  group_by(upn) %>%
+  dplyr::summarize(crp_day_5 = max(crp_mg_l)) %>%
+  select(upn, crp_day_5) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 7, !is.na(crp_mg_l)) %>%
+  select(upn, day, crp_mg_l) %>%
+  group_by(upn) %>%
+  dplyr::summarize(crp_day_7 = max(crp_mg_l)) %>%
+  select(upn, crp_day_7) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 0:30, !is.na(crp_mg_l)) %>%
+  select(upn,
+         crp_mg_l) %>%
+  group_by(upn) %>%
+  dplyr::summarize(crp_max = max(crp_mg_l)) %>%
+  left_join(df, ., by = "upn")
+
+# Add pre-LD, day +0, day +3, day +5, day +7, and peak ferritin to df
+df <- df_pre_ld %>%
+  select(upn, ferritin_ng_ml_pre_d) %>% 
+  rename(ferritin_pre_ld = ferritin_ng_ml_pre_d) %>% 
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 0, !is.na(ferritin_ng_ml)) %>%
+  select(upn, day, time, ferritin_ng_ml) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, ferritin_ng_ml) %>%
+  rename(ferritin_day_0 = ferritin_ng_ml) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 2:4, !is.na(ferritin_ng_ml)) %>%
+  select(upn, day, ferritin_ng_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ferritin_day_3 = max(ferritin_ng_ml)) %>%
+  select(upn, ferritin_day_3) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 5, !is.na(ferritin_ng_ml)) %>%
+  select(upn, day, ferritin_ng_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ferritin_day_5 = max(ferritin_ng_ml)) %>%
+  select(upn, ferritin_day_5) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 7, !is.na(ferritin_ng_ml)) %>%
+  select(upn, day, ferritin_ng_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ferritin_day_7 = max(ferritin_ng_ml)) %>%
+  select(upn, ferritin_day_7) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 0:30, !is.na(ferritin_ng_ml)) %>%
+  select(upn,
+         ferritin_ng_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ferritin_max = max(ferritin_ng_ml)) %>%
+  left_join(df, ., by = "upn")
+
+# Add pre-LD, day +0, day +3, day +5, day +7, and peak IL-6 to df
+df <- df_pre_ld %>%
+  select(upn, il6_pg_ml_pre_d) %>% 
+  rename(il6_pre_ld = il6_pg_ml_pre_d) %>% 
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 0, !is.na(il6_pg_ml)) %>%
+  select(upn, day, time, il6_pg_ml) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, il6_pg_ml) %>%
+  rename(il6_day_0 = il6_pg_ml) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 2:4, !is.na(il6_pg_ml)) %>%
+  select(upn, day, il6_pg_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(il6_day_3 = max(il6_pg_ml)) %>%
+  select(upn, il6_day_3) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 5, !is.na(il6_pg_ml)) %>%
+  select(upn, day, il6_pg_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(il6_day_5 = max(il6_pg_ml)) %>%
+  select(upn, il6_day_5) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 7, !is.na(il6_pg_ml)) %>%
+  select(upn, day, il6_pg_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(il6_day_7 = max(il6_pg_ml)) %>%
+  select(upn, il6_day_7) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 0:30, !is.na(il6_pg_ml)) %>%
+  select(upn, il6_pg_ml) %>%
+  group_by(upn) %>%
+  dplyr::summarize(il6_max = max(il6_pg_ml)) %>%
+  left_join(df, ., by = "upn")
+
+# Add pre-LD, day +0, day +3, day +5, day + 7, and minimum fibrinogen to df
+df <- df_pre_ld %>%
+  select(upn, fibrinogen_mg_dl_pre_d) %>% 
+  rename(fibrinogen_pre_ld = fibrinogen_mg_dl_pre_d) %>% 
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 0, !is.na(fibrinogen_mg_dl)) %>%
+  select(upn, day, time, fibrinogen_mg_dl) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, fibrinogen_mg_dl) %>%
+  rename(fibrinogen_day_0 = fibrinogen_mg_dl) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 2:4, !is.na(fibrinogen_mg_dl)) %>%
+  select(upn, day, fibrinogen_mg_dl) %>%
+  group_by(upn) %>%
+  dplyr::summarize(fibrinogen_day_3 = max(fibrinogen_mg_dl)) %>%
+  select(upn, fibrinogen_day_3) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 5, !is.na(fibrinogen_mg_dl)) %>%
+  select(upn, day, fibrinogen_mg_dl) %>%
+  group_by(upn) %>%
+  dplyr::summarize(fibrinogen_day_5 = max(fibrinogen_mg_dl)) %>%
+  select(upn, fibrinogen_day_5) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 7, !is.na(fibrinogen_mg_dl)) %>%
+  select(upn, day, fibrinogen_mg_dl) %>%
+  group_by(upn) %>%
+  dplyr::summarize(fibrinogen_day_7 = max(fibrinogen_mg_dl)) %>%
+  select(upn, fibrinogen_day_7) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 0:30, !is.na(fibrinogen_mg_dl)) %>%
+  select(upn,
+         fibrinogen_mg_dl) %>%
+  group_by(upn) %>%
+  dplyr::summarize(fibrinogen_min = min(fibrinogen_mg_dl)) %>%
+  left_join(df, ., by = "upn")
+
+# Add pre-LD, day +0, day +3, day +5, day + 7, and peak D-dimer to df
+df <- df_pre_ld %>%
+  select(upn, d_dimer_pre_d) %>% 
+  rename(d_dimer_pre_ld = d_dimer_pre_d) %>% 
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 0, !is.na(d_dimer)) %>%
+  select(upn, day, time, d_dimer) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, d_dimer) %>%
+  rename(d_dimer_day_0 = d_dimer) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 2:4, !is.na(d_dimer)) %>%
+  select(upn, day, d_dimer) %>%
+  group_by(upn) %>%
+  dplyr::summarize(d_dimer_day_3 = max(d_dimer)) %>%
+  select(upn, d_dimer_day_3) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 5, !is.na(d_dimer)) %>%
+  select(upn, day, d_dimer) %>%
+  group_by(upn) %>%
+  dplyr::summarize(d_dimer_day_5 = max(d_dimer)) %>%
+  select(upn, d_dimer_day_5) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 7, !is.na(d_dimer)) %>%
+  select(upn, day, d_dimer) %>%
+  group_by(upn) %>%
+  dplyr::summarize(d_dimer_day_7 = max(d_dimer)) %>%
+  select(upn, d_dimer_day_7) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 0:30, !is.na(d_dimer)) %>%
+  select(upn,
+         d_dimer) %>%
+  group_by(upn) %>%
+  dplyr::summarize(d_dimer_max = max(d_dimer)) %>%
+  left_join(df, ., by = "upn")
+
+# Add pre-LD, day +0, day +3, day +5, day + 7, and peak PTT to df
+df <- df_pre_ld %>%
+  select(upn, ptt_patient_pre_d) %>% 
+  rename(ptt_pre_ld = ptt_patient_pre_d) %>% 
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 0, !is.na(ptt_patient)) %>%
+  select(upn, day, time, ptt_patient) %>%
+  group_by(upn) %>%
+  filter(time == min(time)) %>%
+  select(upn, ptt_patient) %>%
+  rename(ptt_day_0 = ptt_patient) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 2:4, !is.na(ptt_patient)) %>%
+  select(upn, day, ptt_patient) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ptt_day_3 = max(ptt_patient)) %>%
+  select(upn, ptt_day_3) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 5, !is.na(ptt_patient)) %>%
+  select(upn, day, ptt_patient) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ptt_day_5 = max(ptt_patient)) %>%
+  select(upn, ptt_day_5) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day == 7, !is.na(ptt_patient)) %>%
+  select(upn, day, ptt_patient) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ptt_day_7 = max(ptt_patient)) %>%
+  select(upn, ptt_day_7) %>%
+  left_join(df, ., by = "upn")
+
+df <- df_labs %>%
+  filter(day %in% 0:30, !is.na(ptt_patient)) %>%
+  select(upn,
+         ptt_patient) %>%
+  group_by(upn) %>%
+  dplyr::summarize(ptt_max = max(ptt_patient)) %>%
+  left_join(df, ., by = "upn")
+
+# Log10-transform laboratory data
+df <- df %>%
+  mutate(across(anc_pre_ld:ptt_max, ~ifelse(. == 0, 0.01, .), .names = "{.col}_log10")) %>%
+  mutate(across(anc_pre_ld_log10:ptt_max_log10, log10))
+
+var_label(df$anc_pre_ld_log10) <- "Pre-LD ANC"
+var_label(df$lym_pre_ld_log10) <- "Pre-LD ALC"
+var_label(df$hb_pre_ld) <- "Pre-LD Hb"
+var_label(df$plt_pre_ld_log10) <- "Pre-LD platelet count"
+var_label(df$ldh_pre_ld_log10) <- "Pre-LD LDH"
+var_label(df$crp_pre_ld_log10) <- "Pre-LD CRP"
+var_label(df$crp_day_0_log10) <- "Day +0 CRP"
+var_label(df$crp_day_3_log10) <- "Day +3 CRP"
+var_label(df$crp_day_5_log10) <- "Day +5 CRP"
+var_label(df$crp_day_7_log10) <- "Day +7 CRP"
+var_label(df$crp_max_log10) <- "Peak CRP"
+var_label(df$ferritin_pre_ld_log10) <- "Pre-LD ferritin"
+var_label(df$ferritin_day_0_log10) <- "Day +0 ferritin"
+var_label(df$ferritin_day_3_log10) <- "Day +3 ferritin"
+var_label(df$ferritin_day_5_log10) <- "Day +5 ferritin"
+var_label(df$ferritin_day_7_log10) <- "Day +7 ferritin"
+var_label(df$ferritin_max_log10) <- "Peak ferritin"
+var_label(df$il6_pre_ld_log10) <- "Pre-LD IL-6"
+var_label(df$il6_day_0_log10) <- "Day +0 IL-6"
+var_label(df$il6_day_3_log10) <- "Day +3 IL-6"
+var_label(df$il6_day_5_log10) <- "Day +5 IL-6"
+var_label(df$il6_day_7_log10) <- "Day +7 IL-6"
+var_label(df$il6_max_log10) <- "Peak IL-6"
+var_label(df$fibrinogen_pre_ld_log10) <- "Pre-LD fibrinogen"
+var_label(df$fibrinogen_day_0_log10) <- "Day +0 fibrinogen"
+var_label(df$fibrinogen_day_3_log10) <- "Day +3 fibrinogen"
+var_label(df$fibrinogen_day_5_log10) <- "Day +5 fibrinogen"
+var_label(df$fibrinogen_day_7_log10) <- "Day +7 fibrinogen"
+var_label(df$fibrinogen_min_log10) <- "Nadir fibrinogen"
+var_label(df$d_dimer_pre_ld_log10) <- "Pre-LD D-dimer"
+var_label(df$d_dimer_day_0_log10) <- "Day +0 D-dimer"
+var_label(df$d_dimer_day_3_log10) <- "Day +3 D-dimer"
+var_label(df$d_dimer_day_5_log10) <- "Day +5 D-dimer"
+var_label(df$d_dimer_day_7_log10) <- "Day +7 D-dimer"
+var_label(df$d_dimer_max_log10) <- "Peak D-dimer"
+var_label(df$ptt_pre_ld_log10) <- "Pre-LD PTT"
+var_label(df$ptt_day_0_log10) <- "Day +0 PTT"
+var_label(df$ptt_day_3_log10) <- "Day +3 PTT"
+var_label(df$ptt_day_5_log10) <- "Day +5 PTT"
+var_label(df$ptt_day_7_log10) <- "Day +7 PTT"
+var_label(df$ptt_max_log10) <- "Peak PTT"
+```
+
+## Table 1: Patient, disease, and treatment characteristics
+```{r}
+df %>%
+  select(
+    cart_age,
+    gender_desc,
+    racenih,
+    ethnih,
+    prior_hct,
+    disease_cat,
+    anc_pre_ld,
+    hb_pre_ld, 
+    plt_pre_ld,
+    LD_regimen_cat,
+    product_infused,
+    product_cat
+  ) %>%
+  tbl_summary(
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous2"),
+    statistic = list(
+      all_continuous() ~ c("{median} ({p25}, {p75})", "{min} - {max}"),
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_categorical() ~ 0,
+    sort = list(everything() ~ "frequency")
+  ) %>%
+  bold_labels()
+```
+
+## Incidences of early ICAHT by grade
+```{r}
+df %>%
+  select(icaht_grade) %>%
+  tbl_summary(
+    statistic = list(all_categorical() ~ "{n} ({p}%)"),
+    digits = all_categorical() ~ 0,
+    sort = list(everything() ~ "frequency")
+  ) %>%
+  bold_labels()
+```
+
+## Incidences of CRS and ICANS
+```{r}
+df %>%
+  select(crs_grade, icans_grade) %>%
+  tbl_summary(statistic = list(all_categorical() ~ "{n} ({p}%)"))
+```
+
+## Median follow-up and overall survival
+```{r}
+df <- df %>%
+  mutate(
+    OS_code = ifelse(is.na(deathdat), 0, 1),
+    OS_months = as.duration(cart_date %--% datelast) / dmonths(1)
+  )
+
+# Create data frame with OS landmarked at day +30
+df_landmark_OS <- df %>% 
+  filter(OS_months > 30/30.4167) %>% 
+  mutate(OS_months_landmark = OS_months - 30/30.4167)
+
+quantile(prodlim(Hist(OS_months, OS_code) ~ 1, data = df, reverse = TRUE))
+
+surv_OS <- survfit2(Surv(OS_months, OS_code) ~ 1, data = df)
+surv_OS
+
+# 3-year estimate
+summary(surv_OS, times = 36)
+```
+
+## Univariate logistic regression models of grade 3-4 ICAHT
+
+Using log10-transformed laboratory values, except pre-LD hemoglobin due to lack of convergence with log10(pre-LD hemoglobin)
+
+```{r, layout = "l-body-outset", fig.width = 10, fig.height = 8}
+tbl_uvregression <- df %>%
+  select(
+    icaht_grade_3_4,
+    cart_age,
+    gender_desc,
+    racenih_cat,
+    ethnih_cat,
+    prior_hct,
+    disease_cat,
+    LD_regimen_cat,
+    LD_regimen_low_CyFlu_vs_other,
+    car_target,
+    costim_domain,
+    crs_grade, 
+    icans_grade,
+    anc_pre_ld_log10,
+    hb_pre_ld,
+    plt_pre_ld_log10,
+    ldh_pre_ld_log10,
+    crp_pre_ld_log10,
+    crp_day_0_log10,
+    crp_day_3_log10,
+    crp_day_5_log10,
+    crp_day_7_log10,
+    crp_max_log10,
+    ferritin_pre_ld_log10,
+    ferritin_day_0_log10,
+    ferritin_day_3_log10,
+    ferritin_day_5_log10,
+    ferritin_day_7_log10,
+    ferritin_max_log10,
+    il6_pre_ld_log10,
+    il6_day_0_log10,
+    il6_day_3_log10,
+    il6_day_5_log10,
+    il6_day_7_log10,
+    il6_max_log10,
+    fibrinogen_pre_ld_log10,
+    fibrinogen_day_0_log10,
+    fibrinogen_day_3_log10,
+    fibrinogen_day_5_log10,
+    fibrinogen_day_7_log10,
+    fibrinogen_min_log10,
+    d_dimer_pre_ld_log10,
+    d_dimer_day_0_log10,
+    d_dimer_day_3_log10,
+    d_dimer_day_5_log10,
+    d_dimer_day_7_log10,
+    d_dimer_max_log10,
+    ptt_pre_ld_log10,
+    ptt_day_0_log10,
+    ptt_day_3_log10,
+    ptt_day_5_log10,
+    ptt_day_7_log10,
+    ptt_max_log10
+  ) %>%
+  tbl_uvregression(
+    method = glm,
+    y = icaht_grade_3_4,
+    method.args = list(family = binomial),
+    exponentiate = TRUE,
+    pvalue_fun = ~ style_pvalue(.x, digits = 2)
+  ) %>%
+  add_nevent() %>%
+  bold_p() %>%
+  bold_labels()
+tbl_uvregression
+
+df_regression <- tbl_uvregression$table_body %>% 
+  mutate(color = case_when(estimate < 1 & p.value < 0.05 ~ "Low",
+                           estimate > 1 & p.value < 0.05 ~ "High",
+                           .default = "Other"),
+         color = as.factor(color))
+
+vp <-
+  ggplot(data = df_regression, aes(x = estimate, y = -log2(p.value), color = color)) +
+  geom_point() +
+  scale_color_manual(values = c("red", "darkgreen", "darkgray")) + 
+  geom_hline(yintercept = -log2(0.05), color = "black", linetype = "dashed") +
+  geom_hline(yintercept = -log2(0.01), color = "black", linetype = "dashed") +
+  geom_vline(xintercept = 1, color = "black", linetype = "dashed") +
+  geom_text(aes(x = 19, y = 3, label = "p = 0.05"), color = "black", stat = "unique") +
+  geom_text(aes(x = 19, y = 8, label = "p = 0.01"), color = "black", stat = "unique") +
+  geom_text(aes(x = 2, y = 75, label = "OR = 1"), color = "black", stat = "unique") +
+  scale_x_continuous(name = "Odds of grade 3-4 ICAHT", limits = c(0, 20)) +
+  coord_cartesian(clip = "off") +
+  theme(legend.position = "none")
+ggplotly(vp)
+
+options(ggrepel.max.overlaps = Inf)
+vp + geom_text_repel(data = filter(df_regression, p.value < 0.05),
+                  aes(label = var_label))
+```
+
+## CAR-HEMATOTOX score
+
+### Compute CAR-HEMATOTOX scores
+```{r}
+# Impute missing data
+df_car_hematotox <- df %>%
+  select(upn,
+         icaht_grade_3_4,
+         anc_pre_ld,
+         hb_pre_ld,
+         plt_pre_ld,
+         crp_pre_ld,
+         ferritin_pre_ld) 
+
+recipe <- recipe(icaht_grade_3_4 ~ ., data = df_car_hematotox) %>%
+  update_role(upn, new_role = "ID") %>%
+  update_role_requirements("ID", bake = FALSE) %>%
+  step_impute_bag(anc_pre_ld,
+                  hb_pre_ld,
+                  plt_pre_ld,
+                  crp_pre_ld,
+                  ferritin_pre_ld,
+                  seed_val = 100) 
+
+# Extract transformed dataframe
+df_car_hematotox <- recipe %>% 
+  prep() %>% 
+  bake(new_data = NULL)
+
+# Calculate CAR-HEMATOTOX score (continuous)
+df_car_hematotox <- df_car_hematotox %>%
+  mutate(
+    plt_hematotox_score = case_when(
+      plt_pre_ld > 175 ~ 0,
+      plt_pre_ld %in% c(75:175) ~ 1,
+      plt_pre_ld < 75 ~ 2,
+      is.na(plt_pre_ld) ~ NA_real_
+    ),
+    anc_hematotox_score = case_when(
+      anc_pre_ld > 1.2 ~ 0,
+      anc_pre_ld < 1.2 ~ 1,
+      is.na(anc_pre_ld) ~ NA_real_
+    ),
+    hb_hematotox_score = case_when(hb_pre_ld > 9 ~ 0,
+                                   hb_pre_ld < 9 ~ 1,
+                                   is.na(hb_pre_ld) ~ NA_real_),
+    crp_hematotox_score = case_when(crp_pre_ld < 3 ~ 0,
+                                    crp_pre_ld > 3 ~ 1,
+                                    is.na(crp_pre_ld) ~ NA_real_),
+    ferritin_hematotox_score = case_when(
+      ferritin_pre_ld < 650 ~ 0,
+      ferritin_pre_ld %in% c(650:2000) ~ 1,
+      ferritin_pre_ld > 2000 ~ 2,
+      is.na(ferritin_pre_ld) ~ NA_real_
+    )
+  )
+
+# Calculate CAR-HEMATOTOX score (categorical)
+df_car_hematotox <- df_car_hematotox %>%
+  mutate(
+    car_hematotox_score = rowSums(across(
+      plt_hematotox_score:ferritin_hematotox_score
+    )),
+    car_hematotox_categorical = case_when(car_hematotox_score < 2 ~ "Low",
+                                        car_hematotox_score >= 2 ~ "High"),
+    car_hematotox_categorical = as.factor(car_hematotox_categorical),
+    car_hematotox_categorical = fct_relevel(car_hematotox_categorical, c("Low", "High"))
+  )
+
+var_label(df_car_hematotox$car_hematotox_score) <- "CAR-HEMATOTOX score (continuous)"
+var_label(df_car_hematotox$car_hematotox_categorical) <- "CAR-HEMATOTOX score (categorical)"
+```
+
+### Confusion matrix for CAR-HEMATOTOX score in predicting grade 3-4 ICAHT
+```{r}
+df_matrix <- df_car_hematotox %>% 
+  select(upn, icaht_grade_3_4, car_hematotox_categorical) %>% 
+  mutate(car_hematotox_high = ifelse(car_hematotox_categorical == "High", 1, 0)) %>% 
+  drop_na()
+
+expected_value <- factor(df_matrix$icaht_grade_3_4, levels = c("1", "0"))
+predicted_value <- factor(df_matrix$car_hematotox_high, levels = c("1", "0"))
+
+matrix <-
+  confusionMatrix(data = predicted_value,
+                  reference = expected_value,
+                  positive = "1")
+matrix
+```
+
+## Calculate sample size required for predicting grade 3-4 ICAHT (based on Riley et al., BMJ 2020)
+```{r}
+# Set Cox-Snell R squared = 0.1
+# 6 predictors
+pmsampsize(
+  type = "b",
+  nagrsquared = NA,
+  csrsquared = 0.1,
+  rsquared = NA,
+  parameters = 6,
+  shrinkage = 0.9,
+  prevalence = 0.16,
+  cstatistic = NA,
+  seed = 123,
+  rate = NA,
+  timepoint = NA,
+  meanfup = NA,
+  intercept = NA,
+  sd = NA,
+  mmoe = 1.1)
+```
+
+## Development and evaluation of multivariable logistic regression model of grade 3-4 ICAHT: disease type, pre-LD ANC, pre-LD platelet count, pre-LD LDH, and pre-LD ferritin
+
+### Model development and evaluation using {tidymodels}
+
+Create training and tests sets (70%/30%)
+
+```{r}
+# Create data frame for tidy model
+df_tidy <- df %>%
+  mutate(
+    disease_cat = ifelse(disease_cat == "ALL", "ALL", "Other"),
+    disease_cat = factor(disease_cat, levels = c("ALL", "Other"))
+  ) %>%
+  select(
+    upn,
+    icaht_grade_3_4,
+    disease_cat,
+    LD_regimen_low_CyFlu_vs_other,
+    anc_pre_ld_log10,
+    plt_pre_ld_log10,
+    ldh_pre_ld_log10,
+    ferritin_pre_ld_log10,
+    ferritin_day_0_log10,
+    ferritin_day_3_log10,
+    crp_day_3_log10,
+    d_dimer_day_3_log10
+  ) %>%
+  mutate(
+    icaht_grade_3_4 = as.factor(icaht_grade_3_4),
+    icaht_grade_3_4 = fct_relevel(icaht_grade_3_4, c("0", "1"))
+  )
+
+# Split df into training set and testing set
+set.seed(100)
+df_split <-
+  initial_split(df_tidy, prop = 0.7, strata = icaht_grade_3_4)
+df_train <- training(df_split)
+df_test <- testing(df_split)
+
+df_train %>%
+  count(icaht_grade_3_4) %>%
+  mutate(prop = n / sum(n))
+
+df_test %>%
+  count(icaht_grade_3_4) %>%
+  mutate(prop = n / sum(n))
+```
+
+Build and train logistic regression model with LASSO regularization
+
+```{r}
+# Create model recipe to pre-process data
+recipe <- recipe(icaht_grade_3_4 ~ ., data = df_train) %>%
+  update_role(upn, new_role = "ID") %>% # Assign upn to identifier role (as opposed to predictor or outcome)
+  update_role_requirements("ID", bake = FALSE) %>% 
+  step_impute_bag(
+    # Impute missing values (default is to use all other predictors)
+    disease_cat,
+    LD_regimen_low_CyFlu_vs_other,
+    anc_pre_ld_log10,
+    plt_pre_ld_log10,
+    ldh_pre_ld_log10,
+    ferritin_pre_ld_log10,
+    ferritin_day_0_log10,
+    ferritin_day_3_log10,
+    crp_day_3_log10,
+    d_dimer_day_3_log10,
+    seed_val = 100
+  ) %>%
+  # step_zv(all_numeric(), -all_outcomes()) %>% # Remove variables containing only a single value
+  step_normalize(all_numeric(), -all_outcomes()) %>% # Normalize numeric data
+  step_dummy(disease_cat, LD_regimen_low_CyFlu_vs_other) # Create dummy variables for disease_cat (nominal to numeric binary)
+
+# Build model specification
+spec_model <- logistic_reg(penalty = 0.1, mixture = 1) %>%
+  set_engine("glmnet")
+
+# Create model formula
+model_formula <-
+  icaht_grade_3_4 ~ disease_cat_Other + anc_pre_ld_log10 + plt_pre_ld_log10 + ldh_pre_ld_log10 + ferritin_pre_ld_log10
+
+# Create model workflow (bundles recipe and model)
+wf <- workflow() %>%
+  add_model(spec_model, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+# Fit model on training data
+fit_test <- wf %>%
+  fit(data = df_train)
+
+# Extract estimated coefficients
+fit_test %>%
+  extract_fit_parsnip() %>%
+  tidy()
+```
+
+Tune LASSO parameters
+
+```{r}
+# Build set of bootstrap resamples
+set.seed(123)
+bootstrap_resamples <-
+  bootstraps(df_train, strata = icaht_grade_3_4)
+
+# Create tuning specifications
+# Set penalty = tune() instead of to a single value
+tune_spec <- logistic_reg(penalty = tune(), mixture = 1) %>%
+  set_engine("glmnet")
+
+# Use penalty() to set up an appropriate grid
+lambda_grid <- grid_regular(penalty(), levels = 5)
+
+# Tune grid using workflow object
+doParallel::registerDoParallel()
+
+wf_tune <- workflow() %>% 
+  add_model(tune_spec, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+set.seed(2023)
+lasso_grid <- tune_grid(wf_tune,
+                        resamples = bootstrap_resamples,
+                        grid = lambda_grid)
+
+# lasso_grid <- tune_grid(
+#   wf %>% update_model(tune_spec, formula = model_formula),
+#   resamples = bootstrap_resamples,
+#   grid = lambda_grid
+# )
+
+lasso_grid %>% collect_metrics()
+
+# Visualize performance with regularization parameter
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line(linewidth = 1.5) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# Select highest AUROC
+highest_auroc <- lasso_grid %>%
+  select_best(metric = "roc_auc")
+
+# Finalize workflow
+wf_final <-
+  finalize_workflow(wf_tune,
+                    highest_auroc)
+
+# Visualize most important variables
+wf_final %>%
+  fit(data = df_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_auroc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+Fit final best model on training set and evaluate on test set
+
+```{r}
+# Fit the final best model to the training set and evaluate the test set
+final_fit <- last_fit(wf_final,
+                      df_split)
+
+# Extract trained workflow from final_fit
+wf_final_trained <- final_fit %>% 
+  extract_workflow()
+wf_final_trained
+# saveRDS(wf_final_trained, "eIPMPre.rds")
+
+# Extract trained model from final_fit
+final_fit_mod <- final_fit %>%
+  extract_fit_parsnip()
+final_fit_mod
+
+# Extract estimated coefficients from final_fit
+df_final_fit_coefs <- final_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+df_final_fit_coefs
+
+# # Test model against Shiny app output
+# df_test <- tibble(
+#   disease_cat = "ALL",
+#   LD_regimen_low_CyFlu_vs_other = NA,
+#   anc_pre_ld = 1.5,
+#   plt_pre_ld = 175,
+#   ldh_pre_ld = 250,
+#   ferritin_pre_ld = 300,
+#   ferritin_day_0 = NA,
+#   ferritin_day_3 = NA,
+#   crp_day_3 = NA,
+#   d_dimer_day_3 = NA
+# )
+# 
+# df_test <- df_test %>%
+#   mutate(
+#     across(anc_pre_ld:d_dimer_day_3, ~ ifelse(. == 0, 0.01, .), .names = "{.col}_log10"),
+#     across(anc_pre_ld_log10:d_dimer_day_3_log10, log10)
+#   )
+# 
+# predict(wf_final_trained, df_test, type = "prob")
+
+# Compute model-specific variable importance scores for fitted model
+final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+
+# Evaluate final model on test set
+final_fit %>% collect_metrics()
+
+# Plot calibration curve for test set using {runway}
+# Augment df_test (i.e., add columns for predictions to df_train)
+df_mod_pre_ferritin_pre_ld <- wf_final_trained %>%
+  augment(new_data = df_test) %>% 
+  mutate(.pred_class = as.numeric(as.character(.pred_class)))
+
+p_cal_pre_ferritin_pre_ld <- cal_plot(
+  df_mod_pre_ferritin_pre_ld,
+  outcome = "icaht_grade_3_4",
+  positive = "1",
+  prediction = ".pred_1",
+  n_bins = 0,
+  show_loess = TRUE,
+  plot_title = "eIPMPre"
+)
+p_cal_pre_ferritin_pre_ld
+
+# Plot ROC curve for test set
+p_roc_pre_ferritin_pre_ld <- final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = icaht_grade_3_4, .pred_1, event_level = "second") %>%
+  autoplot() +
+  labs(title = "eIPMPre")
+p_roc_pre_ferritin_pre_ld
+```
+
+### Calculate sensitivity/specificity of final model on test dataset using an optimal cutpoint based on the Youden index
+```{r}
+cp <- cutpointr::cutpointr(
+  data = df_mod_pre_ferritin_pre_ld,
+  x = .pred_1,
+  class = icaht_grade_3_4,
+  direction = ">=",
+  pos_class = 1,
+  method = maximize_metric,
+  metric = youden,
+  na.rm = TRUE
+)
+summary(cp)
+```
+
+### Decision curve analysis of final model fitted on test dataset
+```{r}
+df_mod_pre_ferritin_pre_ld <- df_mod_pre_ferritin_pre_ld %>% 
+  mutate(icaht_grade_3_4 = fct_relevel(icaht_grade_3_4, c("0", "1")))
+
+dcurves::dca(icaht_grade_3_4 ~ .pred_1, data = df_mod_pre_ferritin_pre_ld,
+    thresholds = seq(0, 0.35, by = 0.01)) %>% 
+  plot(smooth = TRUE)
+```
+
+## Development and evaluation of multivariable logistic regression model of grade 3-4 ICAHT: disease type, lymphodepletion regimen, pre-LD ANC, pre-LD platelet count, pre-LD LDH, and pre-LD ferritin
+
+### Model development and evaluation using {tidymodels}
+
+Build and train logistic regression model with LASSO regularization
+
+```{r}
+# Create model formula
+model_formula <-
+  icaht_grade_3_4 ~ disease_cat_Other + LD_regimen_low_CyFlu_vs_other_Other + anc_pre_ld_log10 +
+  plt_pre_ld_log10 + ldh_pre_ld_log10 + ferritin_pre_ld_log10
+
+# Create model workflow (bundles recipe and model)
+wf <- workflow() %>%
+  add_model(spec_model, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+# Fit model on training set
+fit_test <- wf %>%
+  fit(data = df_train)
+
+# Extract estimated coefficients
+fit_test %>%
+  extract_fit_parsnip() %>%
+  tidy()
+```
+
+Tune LASSO parameters
+
+```{r}
+# Tune grid using workflow object
+doParallel::registerDoParallel()
+
+wf_tune <- workflow() %>% 
+  add_model(tune_spec, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+set.seed(2023)
+lasso_grid <- tune_grid(wf_tune,
+                        resamples = bootstrap_resamples,
+                        grid = lambda_grid)
+
+lasso_grid %>% collect_metrics()
+
+# Visualize performance with regularization parameter
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line(linewidth = 1.5) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# Select highest accuracy
+highest_auroc <- lasso_grid %>%
+  select_best(metric = "roc_auc")
+
+# Finalize workflow
+wf_final <-
+  finalize_workflow(wf_tune,
+                    highest_auroc)
+
+# Visualize most important variables
+wf_final %>%
+  fit(data = df_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_auroc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+Fit final best model on training set and evaluate on test set
+
+```{r}
+# Fit the final best model to the training set and evaluate the test set
+final_fit <- last_fit(wf_final,
+                      df_split)
+
+# Extract trained workflow from final_fit
+wf_final_trained <- final_fit %>% 
+  extract_workflow()
+wf_final_trained
+
+# Extract trained model from final_fit
+final_fit_mod <- final_fit %>%
+  extract_fit_parsnip()
+final_fit_mod
+
+# Extract estimated coefficients from final_fit
+df_final_fit_coefs <- final_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+df_final_fit_coefs
+
+# Compute model-specific variable importance scores for fitted model
+final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+
+# Evaluate final model on test set
+final_fit %>% collect_metrics()
+
+# Plot calibration curve for test set
+# Using {probably}
+final_fit %>%
+  collect_predictions() %>%
+  cal_plot_breaks(
+    truth = icaht_grade_3_4,
+    estimate = .pred_1,
+    event_level = "second",
+    num_breaks = 5
+  )
+
+# Using {runway}
+# Augment df_test (i.e., add columns for predictions to df_train)
+df_mod_pre_ferritin_pre_ld_LD_regimen <- wf_final_trained %>%
+  augment(new_data = df_test) %>% 
+  mutate(.pred_class = as.numeric(as.character(.pred_class)))
+
+p_cal_pre_ferritin_pre_ld_LD_regimen <- cal_plot(
+  df_mod_pre_ferritin_pre_ld_LD_regimen,
+  outcome = "icaht_grade_3_4",
+  positive = "1",
+  prediction = ".pred_1",
+  n_bins = 0,
+  show_loess = TRUE,
+  plot_title = "eIPMPre (+ LD regimen)"
+)
+p_cal_pre_ferritin_pre_ld_LD_regimen
+
+# Plot ROC curve for test set
+p_roc_pre_ferritin_pre_ld_LD_regimen <- final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = icaht_grade_3_4, .pred_1, event_level = "second") %>%
+  autoplot() +
+  labs(title = "eIPMPre (+ LD regimen)")
+p_roc_pre_ferritin_pre_ld_LD_regimen
+```
+
+### Calculate sensitivity/specificity of final model on test dataset using an optimal cutpoint based on the Youden index
+```{r}
+cp <- cutpointr::cutpointr(
+  data = df_mod_pre_ferritin_pre_ld_LD_regimen,
+  x = .pred_1,
+  class = icaht_grade_3_4,
+  direction = ">=",
+  pos_class = 1,
+  method = maximize_metric,
+  metric = youden,
+  na.rm = TRUE
+)
+summary(cp)
+```
+
+### Decision curve analysis of final model fitted on test set
+```{r}
+df_mod_pre_ferritin_pre_ld_LD_regimen <- df_mod_pre_ferritin_pre_ld_LD_regimen %>%
+  mutate(icaht_grade_3_4 = fct_relevel(icaht_grade_3_4, c("0", "1")))
+
+dcurves::dca(
+  icaht_grade_3_4 ~ .pred_1,
+  data = df_mod_pre_ferritin_pre_ld_LD_regimen,
+  thresholds = seq(0, 0.35, by = 0.01),
+  label = list(.pred_1 = "eIPMPre")
+) %>%
+  plot(smooth = TRUE)
+```
+
+## Development and evaluation of multivariable logistic regression model of grade 3-4 ICAHT: disease type, pre-LD ANC, pre-LD platelet count, pre-LD LDH, and day +3 ferritin
+
+### Model development and evaluation using {tidymodels}
+
+Build and train logistic regression model with LASSO regularization
+
+```{r}
+# Create model formula
+model_formula <-
+  icaht_grade_3_4 ~ disease_cat_Other + anc_pre_ld_log10 + plt_pre_ld_log10 + ldh_pre_ld_log10 + ferritin_day_3_log10
+
+# Create model workflow (bundles recipe and model)
+wf <- workflow() %>%
+  add_model(spec_model, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+# Fit model on training data
+fit_test <- wf %>%
+  fit(data = df_train)
+
+# Extract estimated coefficients
+fit_test %>%
+  extract_fit_parsnip() %>%
+  tidy()
+```
+
+Tune LASSO parameters
+
+```{r}
+# Tune grid using workflow object
+doParallel::registerDoParallel()
+
+wf_tune <- workflow() %>% 
+  add_model(tune_spec, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+set.seed(2023)
+lasso_grid <- tune_grid(wf_tune,
+                        resamples = bootstrap_resamples,
+                        grid = lambda_grid)
+
+lasso_grid %>% collect_metrics()
+
+# Visualize performance with regularization parameter
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line(linewidth = 1.5) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# Select highest AUROC
+highest_auroc <- lasso_grid %>%
+  select_best(metric = "roc_auc")
+
+# Finalize workflow
+wf_final <-
+  finalize_workflow(wf_tune,
+                    highest_auroc)
+
+# Visualize most important variables
+wf_final %>%
+  fit(data = df_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_auroc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+Fit final best model on training set and evaluate on test set
+
+```{r}
+# Fit the final best model to the training set and evaluate the test set
+final_fit <- last_fit(wf_final,
+                      df_split)
+
+# Extract trained workflow from final_fit
+wf_final_trained <- final_fit %>% 
+  extract_workflow()
+wf_final_trained
+# saveRDS(wf_final_trained, "eIPMPost.rds")
+
+# Extract trained model from final_fit
+final_fit_mod <- final_fit %>%
+  extract_fit_parsnip()
+final_fit_mod
+
+# Extract estimated coefficients from final_fit
+df_final_fit_coefs <- final_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+df_final_fit_coefs
+
+# # Test model against Shiny app output
+# df_test <- tibble(
+#   disease_cat = "ALL",
+#   LD_regimen_low_CyFlu_vs_other = NA,
+#   anc_pre_ld = 1.5,
+#   plt_pre_ld = 175,
+#   ldh_pre_ld = 250,
+#   ferritin_pre_ld = NA,
+#   ferritin_day_0 = NA,
+#   ferritin_day_3 = 300,
+#   crp_day_3 = NA,
+#   d_dimer_day_3 = NA
+# )
+# 
+# df_test <- df_test %>%
+#   mutate(
+#     across(anc_pre_ld:d_dimer_day_3, ~ ifelse(. == 0, 0.01, .), .names = "{.col}_log10"),
+#     across(anc_pre_ld_log10:d_dimer_day_3_log10, log10)
+#   )
+# 
+# predict(wf_final_trained, df_test, type = "prob")
+
+# Compute model-specific variable importance scores for fitted model
+final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+
+# Evaluate final model on test set
+final_fit %>% collect_metrics()
+
+# Plot calibration curve for test set
+# Using {probably}
+final_fit %>%
+  collect_predictions() %>%
+  cal_plot_breaks(
+    truth = icaht_grade_3_4,
+    estimate = .pred_1,
+    event_level = "second",
+    num_breaks = 5
+  )
+
+# Using {runway}
+# Augment df_test (i.e., add columns for predictions to df_train)
+df_mod_post_ferritin_only <- wf_final_trained %>%
+  augment(new_data = df_test) %>% 
+  mutate(.pred_class = as.numeric(as.character(.pred_class)))
+
+p_cal_post_ferritin_only <- cal_plot(
+  df_mod_post_ferritin_only,
+  outcome = "icaht_grade_3_4",
+  positive = "1",
+  prediction = ".pred_1",
+  n_bins = 0,
+  show_loess = TRUE,
+  plot_title = "eIPMPost"
+)
+p_cal_post_ferritin_only
+
+# Plot ROC curve for test set
+p_roc_post_ferritin_only <- final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = icaht_grade_3_4, .pred_1, event_level = "second") %>%
+  autoplot() +
+  labs(title = "eIPMPost")
+p_roc_post_ferritin_only
+```
+
+### Calculate sensitivity/specificity of final model on test dataset using an optimal cutpoint based on the Youden index
+```{r}
+cp <- cutpointr::cutpointr(
+  data = df_mod_post_ferritin_only,
+  x = .pred_1,
+  class = icaht_grade_3_4,
+  direction = ">=",
+  pos_class = 1,
+  method = maximize_metric,
+  metric = youden,
+  na.rm = TRUE
+)
+summary(cp)
+```
+
+### Decision curve analysis of final model fitted on test dataset
+```{r}
+df_mod_post_ferritin_only <- df_mod_post_ferritin_only %>% 
+  mutate(icaht_grade_3_4 = fct_relevel(icaht_grade_3_4, c("0", "1")))
+
+dcurves::dca(icaht_grade_3_4 ~ .pred_1, data = df_mod_post_ferritin_only,
+    thresholds = seq(0, 0.35, by = 0.01)) %>% 
+  plot(smooth = TRUE)
+```
+
+## Development and evaluation of multivariable logistic regression model of grade 3-4 ICAHT: disease type, pre-LD ANC, pre-LD platelet count, pre-LD LDH, day +3 ferritin, and day +3 CRP
+
+### Model development and evaluation using {tidymodels}
+
+Build and train logistic regression model with LASSO regularization
+
+```{r}
+# Create model formula
+model_formula <-
+  icaht_grade_3_4 ~ disease_cat_Other + anc_pre_ld_log10 + plt_pre_ld_log10 + ldh_pre_ld_log10 +
+  ferritin_day_3_log10 + crp_day_3_log10
+
+# Create model workflow (bundles recipe and model)
+wf <- workflow() %>%
+  add_model(spec_model, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+# Fit model on training data
+fit_test <- wf %>%
+  fit(data = df_train)
+
+# Extract estimated coefficients
+fit_test %>%
+  extract_fit_parsnip() %>%
+  tidy()
+```
+
+Tune LASSO parameters
+
+```{r}
+# Tune grid using workflow object
+doParallel::registerDoParallel()
+
+wf_tune <- workflow() %>% 
+  add_model(tune_spec, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+set.seed(2023)
+lasso_grid <- tune_grid(wf_tune,
+                        resamples = bootstrap_resamples,
+                        grid = lambda_grid)
+
+lasso_grid %>% collect_metrics()
+
+# Visualize performance with regularization parameter
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line(linewidth = 1.5) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# Select highest AUROC
+highest_auroc <- lasso_grid %>%
+  select_best(metric = "roc_auc")
+
+# Finalize workflow
+wf_final <-
+  finalize_workflow(wf_tune,
+                    highest_auroc)
+
+# Visualize most important variables
+wf_final %>%
+  fit(data = df_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_auroc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+Fit final best model on training set and evaluate on test set
+
+```{r}
+# Fit the final best model to the training set and evaluate the test set
+final_fit <- last_fit(wf_final,
+                      df_split)
+
+# Extract trained workflow from final_fit
+wf_final_trained <- final_fit %>% 
+  extract_workflow()
+wf_final_trained
+
+# Extract trained model from final_fit
+final_fit_mod <- final_fit %>%
+  extract_fit_parsnip()
+final_fit_mod
+
+# Extract estimated coefficients from final_fit
+df_final_fit_coefs <- final_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+df_final_fit_coefs
+
+# Compute model-specific variable importance scores for fitted model
+final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+
+# Evaluate final model on test set
+final_fit %>% collect_metrics()
+
+# Plot calibration curve for test set
+# Using {probably}
+final_fit %>%
+  collect_predictions() %>%
+  cal_plot_breaks(
+    truth = icaht_grade_3_4,
+    estimate = .pred_1,
+    event_level = "second",
+    num_breaks = 5
+  )
+
+# Using {runway}
+# Augment df_test (i.e., add columns for predictions to df_train)
+df_mod_post_crp <- wf_final_trained %>%
+  augment(new_data = df_test) %>% 
+  mutate(.pred_class = as.numeric(as.character(.pred_class)))
+
+p_cal_post_crp <- cal_plot(
+  df_mod_post_crp,
+  outcome = "icaht_grade_3_4",
+  positive = "1",
+  prediction = ".pred_1",
+  n_bins = 0,
+  show_loess = TRUE,
+  plot_title = "eIPMPost (+ day +3 CRP)"
+)
+p_cal_post_crp
+
+# Plot ROC curve for test set
+p_roc_post_crp <- final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = icaht_grade_3_4, .pred_1, event_level = "second") %>%
+  autoplot() +
+  labs(title = "eIPMPost (+ day +3 CRP)")
+p_roc_post_crp
+```
+
+### Calculate sensitivity/specificity of final model on test dataset using an optimal cutpoint based on the Youden index
+```{r}
+cp <- cutpointr::cutpointr(
+  data = df_mod_post_crp,
+  x = .pred_1,
+  class = icaht_grade_3_4,
+  direction = ">=",
+  pos_class = 1,
+  method = maximize_metric,
+  metric = youden,
+  na.rm = TRUE
+)
+summary(cp)
+```
+
+### Decision curve analysis of final model fitted on test dataset
+```{r}
+df_mod_post_crp <- df_mod_post_crp %>% 
+  mutate(icaht_grade_3_4 = fct_relevel(icaht_grade_3_4, c("0", "1")))
+
+dcurves::dca(icaht_grade_3_4 ~ .pred_1, data = df_mod_post_crp,
+    thresholds = seq(0, 0.35, by = 0.01)) %>% 
+  plot(smooth = TRUE)
+```
+
+## Development and evaluation of multivariable logistic regression model of grade 3-4 ICAHT: disease type, pre-LD ANC, pre-LD platelet count, pre-LD LDH, day +3 ferritin, and day +3 D-dimer
+
+### Model development and evaluation using {tidymodels}
+
+Build and train logistic regression model with LASSO regularization
+
+```{r}
+# Create model formula
+model_formula <-
+  icaht_grade_3_4 ~ disease_cat_Other + anc_pre_ld_log10 + plt_pre_ld_log10 + ldh_pre_ld_log10 +
+  ferritin_day_3_log10 + d_dimer_day_3_log10
+
+# Create model workflow (bundles recipe and model)
+wf <- workflow() %>%
+  add_model(spec_model, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+# Fit model on training data
+fit_test <- wf %>%
+  fit(data = df_train)
+
+# Extract estimated coefficients
+fit_test %>%
+  extract_fit_parsnip() %>%
+  tidy()
+```
+
+Tune LASSO parameters
+
+```{r}
+# Tune grid using workflow object
+doParallel::registerDoParallel()
+
+wf_tune <- workflow() %>% 
+  add_model(tune_spec, formula = model_formula) %>% 
+  add_recipe(recipe)
+
+set.seed(2023)
+lasso_grid <- tune_grid(wf_tune,
+                        resamples = bootstrap_resamples,
+                        grid = lambda_grid)
+
+lasso_grid %>% collect_metrics()
+
+# Visualize performance with regularization parameter
+lasso_grid %>%
+  collect_metrics() %>%
+  ggplot(aes(x = penalty, y = mean, color = .metric)) +
+  geom_errorbar(aes(ymin = mean - std_err, ymax = mean + std_err), alpha = 0.5) +
+  geom_line(linewidth = 1.5) +
+  facet_wrap(~ .metric, scales = "free", nrow = 2) +
+  scale_x_log10() +
+  theme(legend.position = "none")
+
+# Select highest AUROC
+highest_auroc <- lasso_grid %>%
+  select_best(metric = "roc_auc")
+
+# Finalize workflow
+wf_final <-
+  finalize_workflow(wf_tune,
+                    highest_auroc)
+
+# Visualize most important variables
+wf_final %>%
+  fit(data = df_train) %>%
+  pull_workflow_fit() %>%
+  vi(lambda = highest_auroc$penalty) %>%
+  mutate(Importance = abs(Importance),
+         Variable = fct_reorder(Variable, Importance)) %>%
+  ggplot(aes(x = Importance, y = Variable, fill = Sign)) +
+  geom_col() +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(y = NULL)
+```
+
+Fit final best model on training set and evaluate on test set
+
+```{r}
+# Fit the final best model to the training set and evaluate the test set
+final_fit <- last_fit(wf_final,
+                      df_split)
+
+# Extract trained workflow from final_fit
+wf_final_trained <- final_fit %>% 
+  extract_workflow()
+wf_final_trained
+
+# Extract trained model from final_fit
+final_fit_mod <- final_fit %>%
+  extract_fit_parsnip()
+final_fit_mod
+
+# Extract estimated coefficients from final_fit
+df_final_fit_coefs <- final_fit %>%
+  extract_fit_parsnip() %>%
+  tidy()
+df_final_fit_coefs
+
+# Compute model-specific variable importance scores for fitted model
+final_fit %>% 
+  extract_fit_parsnip() %>% 
+  vip()
+
+# Evaluate final model on test set
+final_fit %>% collect_metrics()
+
+# Plot calibration curve for test set
+# Using {probably}
+final_fit %>%
+  collect_predictions() %>%
+  cal_plot_breaks(
+    truth = icaht_grade_3_4,
+    estimate = .pred_1,
+    event_level = "second",
+    num_breaks = 5
+  )
+
+# Using {runway}
+# Augment df_test (i.e., add columns for predictions to df_train)
+df_mod_post_d_dimer <- wf_final_trained %>%
+  augment(new_data = df_test) %>% 
+  mutate(.pred_class = as.numeric(as.character(.pred_class)))
+
+p_cal_post_d_dimer <- cal_plot(
+  df_mod_post_d_dimer,
+  outcome = "icaht_grade_3_4",
+  positive = "1",
+  prediction = ".pred_1",
+  n_bins = 0,
+  show_loess = TRUE,
+  plot_title = "eIPMPost (+ day +3 D-dimer)"
+)
+p_cal_post_d_dimer
+
+# Plot ROC curve for test set
+p_roc_post_d_dimer <- final_fit %>%
+  collect_predictions() %>%
+  roc_curve(truth = icaht_grade_3_4, .pred_1, event_level = "second") %>%
+  autoplot() +
+  labs(title = "eIPMPost (+ day +3 D-dimer)")
+p_roc_post_d_dimer
+```
+
+### Calculate sensitivity/specificity of final model on test dataset using an optimal cutpoint based on the Youden index
+```{r}
+cp <- cutpointr::cutpointr(
+  data = df_mod_post_d_dimer,
+  x = .pred_1,
+  class = icaht_grade_3_4,
+  direction = ">=",
+  pos_class = 1,
+  method = maximize_metric,
+  metric = youden,
+  na.rm = TRUE
+)
+summary(cp)
+```
+
+### Decision curve analysis of final model fitted on test dataset
+```{r}
+df_mod_post_d_dimer <- df_mod_post_d_dimer %>% 
+  mutate(icaht_grade_3_4 = fct_relevel(icaht_grade_3_4, c("0", "1")))
+
+dcurves::dca(icaht_grade_3_4 ~ .pred_1, data = df_mod_post_d_dimer,
+    thresholds = seq(0, 0.35, by = 0.01)) %>% 
+  plot(smooth = TRUE)
+```
+
+## Decision curve analyses of early ICAHT prediction models (eIPM)
+
+### eIPMPre vs. eIPMPost
+```{r}
+df_mod_all <- df_mod_pre_ferritin_pre_ld %>%
+  rename(predictions_pre_ferritin_pre_ld = .pred_1) %>%
+  left_join(
+    .,
+    df_mod_pre_ferritin_pre_ld_LD_regimen %>% select(upn, predictions_pre_ferritin_pre_ld_LD_regimen = .pred_1),
+    by = "upn"
+  ) %>%
+  left_join(.,
+            df_mod_post_crp %>% select(upn, predictions_post_crp = .pred_1),
+            by = "upn") %>%
+  left_join(
+    .,
+    df_mod_post_d_dimer %>% select(upn, predictions_post_d_dimer = .pred_1),
+    by = "upn"
+  ) %>%
+  left_join(
+    .,
+    df_mod_post_ferritin_only %>% select(upn, predictions_post_ferritin_only = .pred_1),
+    by = "upn"
+  ) %>%
+  select(
+    upn,
+    icaht_grade_3_4,
+    predictions_pre_ferritin_pre_ld,
+    predictions_pre_ferritin_pre_ld_LD_regimen,
+    predictions_post_ferritin_only,
+    predictions_post_crp,
+    predictions_post_d_dimer
+  )
+
+dcurves::dca(
+  icaht_grade_3_4 ~ predictions_pre_ferritin_pre_ld + predictions_post_ferritin_only,
+  data = df_mod_all,
+  thresholds = seq(0, 0.35, by = 0.01),
+  label = list(
+    predictions_pre_ferritin_pre_ld = "eIPMPre",
+    predictions_post_ferritin_only = "eIPMPost"
+  )
+) %>%
+  plot(smooth = TRUE)
+```
+
+### eIPMPre with pre-LD ferritin vs. eIPMPre (+ LD regimen) vs. all eIPMPosts
+```{r}
+dcurves::dca(
+  icaht_grade_3_4 ~ predictions_pre_ferritin_pre_ld + predictions_pre_ferritin_pre_ld_LD_regimen +
+    predictions_post_ferritin_only + predictions_post_crp + predictions_post_d_dimer,
+  data = df_mod_all,
+  thresholds = seq(0, 0.35, by = 0.01),
+  label = list(
+    predictions_pre_ferritin_pre_ld = "eIPMPre",
+    predictions_pre_ferritin_pre_ld_LD_regimen = "eIPMPre (+ LD regimen)",
+    predictions_post_ferritin_only = "eIPMPost",
+    predictions_post_crp ="eIPMPost (+ day +3 CRP)",
+    predictions_post_d_dimer ="eIPMPost (+ day +3 D-dimer)"
+  )
+) %>%
+  plot(smooth = TRUE)
+```
+
+## Patchwork layout of ROC curves of eIPMPre with pre-LD ferritin, eIPMPre (+ LD regimen), and all eIPMPosts
+```{r, layout = "l-body-outset", fig.width = 8, fig.height = 12}
+p <- p_roc_pre_ferritin_pre_ld + p_roc_pre_ferritin_pre_ld_LD_regimen + p_roc_post_ferritin_only +
+  p_roc_post_crp + p_roc_post_d_dimer
+p + plot_layout(ncol = 2) + plot_annotation(tag_levels = "A")
+```
+
+## Characteristics of training and test cohorts
+
+### Training cohort
+```{r}
+df %>% 
+  filter(upn %in% df_train$upn) %>% 
+  select(
+    cart_age,
+    gender_desc,
+    racenih,
+    ethnih,
+    prior_hct,
+    disease_cat,
+    anc_pre_ld,
+    hb_pre_ld, 
+    plt_pre_ld,
+    LD_regimen_cat,
+    product_infused,
+    product_cat,
+    costim_domain
+  ) %>%
+  tbl_summary(
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous2"),
+    statistic = list(
+      all_continuous() ~ c("{median} ({p25}, {p75})", "{min} - {max}"),
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_categorical() ~ 0,
+    sort = list(everything() ~ "frequency")
+  ) %>%
+  bold_labels()
+```
+
+### Test cohort
+```{r}
+df %>% 
+  filter(upn %in% df_test$upn) %>% 
+  select(
+    cart_age,
+    gender_desc,
+    racenih,
+    ethnih,
+    prior_hct,
+    disease_cat,
+    anc_pre_ld,
+    hb_pre_ld, 
+    plt_pre_ld,
+    LD_regimen_cat,
+    product_infused,
+    product_cat,
+    costim_domain
+  ) %>%
+  tbl_summary(
+    missing_text = "Missing",
+    type = list(all_continuous() ~ "continuous2"),
+    statistic = list(
+      all_continuous() ~ c("{median} ({p25}, {p75})", "{min} - {max}"),
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_categorical() ~ 0,
+    sort = list(everything() ~ "frequency")
+  ) %>%
+  bold_labels()
+```
+
+## 5th and 95th percentiles of numeric variables in eIPMs
+```{r}
+df %>% 
+  filter(upn %in% df_train$upn) %>% 
+  plyr::summarize(
+    anc_pre_ld_5p = quantile(anc_pre_ld, 0.05, na.rm = TRUE),
+    plt_pre_ld_5p = quantile(plt_pre_ld, 0.05, na.rm = TRUE),
+    ldh_pre_ld_5p = quantile(ldh_pre_ld, 0.05, na.rm = TRUE),
+    ferritin_pre_ld_5p = quantile(ferritin_pre_ld, 0.05, na.rm = TRUE),
+    ferritin_day_3_5p = quantile(ferritin_day_3, 0.05, na.rm = TRUE)
+  )
+
+df %>% 
+  filter(upn %in% df_train$upn) %>% 
+  plyr::summarize(
+    anc_pre_ld_95p = quantile(anc_pre_ld, 0.95, na.rm = TRUE),
+    plt_pre_ld_95p = quantile(plt_pre_ld, 0.95, na.rm = TRUE),
+    ldh_pre_ld_95p = quantile(ldh_pre_ld, 0.95, na.rm = TRUE),
+    ferritin_pre_ld_95p = quantile(ferritin_pre_ld, 0.95, na.rm = TRUE),
+    ferritin_day_3_95p = quantile(ferritin_day_3, 0.95, na.rm = TRUE)
+  )
+```
+
+## Computational environment
+```{r}
+devtools::session_info() 
+```
