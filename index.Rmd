@@ -375,7 +375,7 @@ df_icaht <- df_icaht %>%
            .keep_all = TRUE)
 ```
 
-### Update ICAHT grades for patients who were included Liang, Rejeski, et al., Bone Marrow Transplantation 2024 (n = 605)
+### Update ICAHT grades for patients who were included in Liang, Rejeski, et al., Bone Marrow Transplantation 2024 (n = 605)
 ```{r}
 # Data frame contains automated grades assigned by {heatwaveR} approach, MSKCC manual code, and manual grades for discrepancies
 df_check <-
