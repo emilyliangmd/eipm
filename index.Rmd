@@ -953,6 +953,14 @@ recipe <- recipe(icaht_grade_3_4 ~ ., data = df_train) %>%
   step_normalize(all_numeric(), -all_outcomes()) %>% # Normalize numeric data
   step_dummy(disease_cat, bridging_yn, LD_regimen_low_CyFlu_vs_other) # Create dummy variables (nominal to numeric binary)
 
+# Prep (apply pre-processing steps) and tidy the recipe (return data frame of pre-processing steps)
+prep(recipe) %>% 
+  tidy()
+
+# Tidy step_normalize (extract mean and SD)
+prep(recipe) %>% 
+  tidy(number = 2)
+
 # Build model specification
 spec_model <- logistic_reg(penalty = 0.1, mixture = 1) %>%
   set_engine("glmnet")
